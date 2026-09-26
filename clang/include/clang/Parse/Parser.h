@@ -7101,6 +7101,7 @@ private:
   std::unique_ptr<PragmaHandler> UnusedHandler;
   std::unique_ptr<PragmaHandler> WeakHandler;
   std::unique_ptr<PragmaHandler> RedefineExtnameHandler;
+  std::unique_ptr<PragmaHandler> MapHandler;
   std::unique_ptr<PragmaHandler> FPContractHandler;
   std::unique_ptr<PragmaHandler> OpenCLExtensionHandler;
   std::unique_ptr<PragmaHandler> OpenMPHandler;

@@ -27,6 +27,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/Support/ConvertEBCDIC.h"
 #include <optional>
 using namespace clang;
 
@@ -80,6 +81,15 @@ struct PragmaUnusedHandler : public PragmaHandler {
 
 struct PragmaWeakHandler : public PragmaHandler {
   explicit PragmaWeakHandler() : PragmaHandler("weak") {}
+  void HandlePragma(Preprocessor &PP, PragmaIntroducer Introducer,
+                    Token &FirstToken) override;
+};
+
+/// "\#pragma map(identifier, "name")" (z/OS): use "name" as the external name
+/// of the C function or variable identifier. Like redefine_extname, the
+/// pragma may appear before or after the declaration.
+struct PragmaMapHandler : public PragmaHandler {
+  explicit PragmaMapHandler() : PragmaHandler("map") {}
   void HandlePragma(Preprocessor &PP, PragmaIntroducer Introducer,
                     Token &FirstToken) override;
 };
@@ -444,6 +454,11 @@ void Parser::initializePragmaHandlers() {
   RedefineExtnameHandler = std::make_unique<PragmaRedefineExtnameHandler>();
   PP.AddPragmaHandler(RedefineExtnameHandler.get());
 
+  if (getTargetInfo().getTriple().isOSzOS()) {
+    MapHandler = std::make_unique<PragmaMapHandler>();
+    PP.AddPragmaHandler(MapHandler.get());
+  }
+
   FPContractHandler = std::make_unique<PragmaFPContractHandler>();
   PP.AddPragmaHandler("STDC", FPContractHandler.get());
 
@@ -596,6 +611,11 @@ void Parser::resetPragmaHandlers() {
   WeakHandler.reset();
   PP.RemovePragmaHandler(RedefineExtnameHandler.get());
   RedefineExtnameHandler.reset();
+
+  if (MapHandler) {
+    PP.RemovePragmaHandler(MapHandler.get());
+    MapHandler.reset();
+  }
 
   if (getLangOpts().OpenCL) {
     PP.RemovePragmaHandler("OPENCL", OpenCLExtensionHandler.get());
@@ -2677,6 +2697,108 @@ void PragmaWeakHandler::HandlePragma(Preprocessor &PP,
 }
 
 // #pragma redefine_extname identifier identifier
+/// Decode the name of a "\#pragma map". The string gives the external name as
+/// it appears in the object file: characters are taken as written, while
+/// escape sequences denote code points of the object file character set
+/// EBCDIC (IBM-1047), as in the z/OS system headers ("\174" is '@'). Symbol
+/// names are kept in ASCII inside LLVM and converted when the object file is
+/// written, so escaped bytes are converted from EBCDIC here.
+static bool decodePragmaMapName(StringRef Spelling, std::string &Name) {
+  if (Spelling.size() < 2 || Spelling.front() != '"' || Spelling.back() != '"')
+    return false;
+  StringRef S = Spelling.drop_front().drop_back();
+  for (size_t I = 0, E = S.size(); I < E; ++I) {
+    if (S[I] != '\\') {
+      Name += S[I];
+      continue;
+    }
+    if (++I == E)
+      return false;
+    unsigned Byte = 0;
+    if (S[I] >= '0' && S[I] <= '7') {
+      for (unsigned N = 0; N < 3 && I < E && S[I] >= '0' && S[I] <= '7'; ++N)
+        Byte = Byte * 8 + (S[I++] - '0');
+      --I;
+    } else if (S[I] == 'x') {
+      unsigned N = 0;
+      while (I + 1 < E && llvm::isHexDigit(S[I + 1])) {
+        Byte = Byte * 16 + llvm::hexDigitValue(S[++I]);
+        ++N;
+      }
+      if (N == 0 || Byte > 0xFF)
+        return false;
+    } else {
+      Name += S[I]; // \" or \\ and the like.
+      continue;
+    }
+    char EBCDIC = static_cast<char>(Byte);
+    SmallString<4> UTF8;
+    llvm::ConverterEBCDIC::convertToUTF8(StringRef(&EBCDIC, 1), UTF8);
+    Name += UTF8.str();
+  }
+  return !Name.empty();
+}
+
+void PragmaMapHandler::HandlePragma(Preprocessor &PP,
+                                    PragmaIntroducer Introducer,
+                                    Token &FirstToken) {
+  SourceLocation MapLoc = FirstToken.getLocation();
+  Token Tok;
+  PP.Lex(Tok);
+  if (Tok.isNot(tok::l_paren)) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_lparen) << "map";
+    return;
+  }
+  // The identifier is the name as declared, so do not expand macros.
+  PP.LexUnexpandedToken(Tok);
+  if (Tok.isNot(tok::identifier)) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_identifier) << "map";
+    return;
+  }
+  Token NameTok = Tok;
+  PP.Lex(Tok);
+  if (Tok.isNot(tok::comma)) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_comma) << "map";
+    return;
+  }
+  PP.Lex(Tok);
+  std::string MappedName;
+  if (Tok.isNot(tok::string_literal) ||
+      !decodePragmaMapName(PP.getSpelling(Tok), MappedName)) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_string) << "map";
+    return;
+  }
+  SourceLocation MappedLoc = Tok.getLocation();
+  PP.Lex(Tok);
+  if (Tok.isNot(tok::r_paren)) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_expected_rparen) << "map";
+    return;
+  }
+  PP.Lex(Tok);
+  if (Tok.isNot(tok::eod)) {
+    PP.Diag(Tok.getLocation(), diag::warn_pragma_extra_tokens_at_eol) << "map";
+    return;
+  }
+
+  // Handled like "#pragma redefine_extname identifier mapped-name".
+  Token MappedTok;
+  MappedTok.startToken();
+  MappedTok.setKind(tok::identifier);
+  MappedTok.setIdentifierInfo(PP.getIdentifierInfo(MappedName));
+  MappedTok.setLocation(MappedLoc);
+
+  MutableArrayRef<Token> Toks(PP.getPreprocessorAllocator().Allocate<Token>(3),
+                              3);
+  Toks[0].startToken();
+  Toks[0].setKind(tok::annot_pragma_redefine_extname);
+  Toks[0].setLocation(MapLoc);
+  Toks[0].setAnnotationEndLoc(MappedLoc);
+  Toks[1] = NameTok;
+  Toks[2] = MappedTok;
+  PP.EnterTokenStream(Toks, /*DisableMacroExpansion=*/true,
+                      /*IsReinject=*/false);
+}
+
 void PragmaRedefineExtnameHandler::HandlePragma(Preprocessor &PP,
                                                 PragmaIntroducer Introducer,
                                                 Token &RedefToken) {
